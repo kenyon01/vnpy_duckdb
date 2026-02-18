@@ -1,5 +1,5 @@
 [project]
-name = "vnpy_duckdb"
+name = "vnpy_duckdb_unofficial"
 dynamic = ["version"]
 description = "DuckDB database adapter for VeighNa quant trading framework."
 license = {text = "MIT"}

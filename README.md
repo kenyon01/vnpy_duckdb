@@ -1,10 +1,10 @@
-# vnpy_duckdb
+# vnpy_duckdb_unofficial
 
-[VeighNa](https://www.vnpy.com) 量化交易框架的 DuckDB 数据库驱动。
+[VeighNa](https://www.vnpy.com) 量化交易框架的 DuckDB 数据库驱动（非官方）。
 
 ## 简介
 
-`vnpy_duckdb` 将 [DuckDB](https://duckdb.org/) 嵌入式分析型数据库接入 VeighNa 框架的标准数据库接口（`BaseDatabase`），支持 K 线（Bar）和 Tick 行情数据的存储与查询。
+`vnpy_duckdb_unofficial` 将 [DuckDB](https://duckdb.org/) 嵌入式分析型数据库接入 VeighNa 框架的标准数据库接口（`BaseDatabase`），支持 K 线（Bar）和 Tick 行情数据的存储与查询。安装后 Python 模块名为 `vnpy_duckdb`，与 VeighNa 的 `database.name = "duckdb"` 配置直接兼容，无需修改任何框架设置。
 
 DuckDB 相比 SQLite 具有更强的列式存储和批量查询性能，且无需独立服务进程，适合本地量化研究场景。
 
@@ -47,7 +47,7 @@ DuckDB 在 Windows 上不支持多进程同时以读写模式访问同一文件�
 ## 安装
 
 ```bash
-pip install vnpy_duckdb
+pip install vnpy_duckdb_unofficial
 ```
 
 或从源码安装：
