@@ -1,0 +1,42 @@
+[project]
+name = "vnpy_duckdb"
+dynamic = ["version"]
+description = "DuckDB database adapter for VeighNa quant trading framework."
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Natural Language :: Chinese (Simplified)",
+    "Typing :: Typed"
+]
+requires-python = ">=3.10"
+dependencies = [
+    "duckdb>=0.10.0",
+]
+keywords = ["quant", "quantitative", "investment", "trading", "algotrading"]
+
+[project.urls]
+"Homepage" = "https://www.vnpy.com"
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "vnpy_duckdb/__init__.py"
+pattern = "__version__ = ['\"](?P<version>[^'\"]+)['\"]"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vnpy_duckdb"]
+include-package-data = true
+
+[tool.hatch.build.targets.sdist]
+include = ["vnpy_duckdb*"]
