@@ -1,5 +1,9 @@
+import multiprocessing
+import os
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Generator
 
 import duckdb
 
@@ -18,19 +22,54 @@ from vnpy.trader.setting import SETTINGS
 DB_PATH: str = SETTINGS["database.database"]
 
 
+def _is_multiprocessing_worker() -> bool:
+    """检测当前是否在多进程子进程中运行"""
+    current_process = multiprocessing.current_process()
+    if hasattr(current_process, "_parent_pid") and current_process._parent_pid is not None:
+        return True
+    if os.environ.get("PYTHON_MULTIPROCESSING") == "1":
+        return True
+    return False
+
+
 class DuckdbDatabase(BaseDatabase):
     """DuckDB数据库接口"""
 
     def __init__(self) -> None:
-        """"""
+        """初始化数据库连接"""
         path: Path = Path(DB_PATH)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn: duckdb.DuckDBPyConnection = duckdb.connect(str(path))
-        self._create_tables()
+        self._path: Path = path
 
-    def _create_tables(self) -> None:
+        # 主进程：用读写连接初始化表结构后立即关闭
+        # 子进程：表已存在，跳过建表直接以只读连接
+        if not _is_multiprocessing_worker():
+            write_conn: duckdb.DuckDBPyConnection = duckdb.connect(str(path))
+            try:
+                self._create_tables(write_conn)
+            finally:
+                write_conn.close()
+
+        # 所有进程均以只读模式连接，支持多进程并发读取
+        self.conn: duckdb.DuckDBPyConnection = duckdb.connect(str(path), read_only=True)
+
+    @contextmanager
+    def _write_conn(self) -> Generator[duckdb.DuckDBPyConnection, None, None]:
+        """
+        临时切换到读写连接，执行写操作后自动恢复只读连接。
+        写操作（数据导入/删除）与多进程优化不会同时发生，因此此切换是安全的。
+        """
+        self.conn.close()
+        write_conn: duckdb.DuckDBPyConnection = duckdb.connect(str(self._path))
+        try:
+            yield write_conn
+        finally:
+            write_conn.close()
+            self.conn = duckdb.connect(str(self._path), read_only=True)
+
+    def _create_tables(self, conn: duckdb.DuckDBPyConnection) -> None:
         """创建数据表"""
-        self.conn.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS bar_data (
                 symbol        VARCHAR   NOT NULL,
                 exchange      VARCHAR   NOT NULL,
@@ -47,7 +86,7 @@ class DuckdbDatabase(BaseDatabase):
             )
         """)
 
-        self.conn.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS tick_data (
                 symbol        VARCHAR   NOT NULL,
                 exchange      VARCHAR   NOT NULL,
@@ -89,7 +128,7 @@ class DuckdbDatabase(BaseDatabase):
             )
         """)
 
-        self.conn.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS bar_overview (
                 symbol   VARCHAR   NOT NULL,
                 exchange VARCHAR   NOT NULL,
@@ -101,7 +140,7 @@ class DuckdbDatabase(BaseDatabase):
             )
         """)
 
-        self.conn.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS tick_overview (
                 symbol   VARCHAR   NOT NULL,
                 exchange VARCHAR   NOT NULL,
@@ -114,13 +153,11 @@ class DuckdbDatabase(BaseDatabase):
 
     def save_bar_data(self, bars: list[BarData], stream: bool = False) -> bool:
         """保存K线数据"""
-        # 读取主键参数
         bar: BarData = bars[0]
         symbol: str = bar.symbol
         exchange: Exchange = bar.exchange
         interval: Interval = bar.interval
 
-        # 将BarData数据转换为元组列表，并调整时区
         data: list[tuple] = []
         for bar in bars:
             bar.datetime = convert_tz(bar.datetime)
@@ -138,63 +175,60 @@ class DuckdbDatabase(BaseDatabase):
                 bar.close_price,
             ))
 
-        # 使用upsert操作将数据批量写入数据库
-        self.conn.executemany("""
-            INSERT INTO bar_data VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (symbol, exchange, interval, datetime) DO UPDATE SET
-                volume        = excluded.volume,
-                turnover      = excluded.turnover,
-                open_interest = excluded.open_interest,
-                open_price    = excluded.open_price,
-                high_price    = excluded.high_price,
-                low_price     = excluded.low_price,
-                close_price   = excluded.close_price
-        """, data)
+        with self._write_conn() as conn:
+            conn.executemany("""
+                INSERT INTO bar_data VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (symbol, exchange, interval, datetime) DO UPDATE SET
+                    volume        = excluded.volume,
+                    turnover      = excluded.turnover,
+                    open_interest = excluded.open_interest,
+                    open_price    = excluded.open_price,
+                    high_price    = excluded.high_price,
+                    low_price     = excluded.low_price,
+                    close_price   = excluded.close_price
+            """, data)
 
-        # 更新K线汇总数据
-        row: tuple | None = self.conn.execute("""
-            SELECT count, start_dt, end_dt FROM bar_overview
-            WHERE symbol = ? AND exchange = ? AND interval = ?
-        """, [symbol, exchange.value, interval.value]).fetchone()
-
-        if not row:
-            self.conn.execute("""
-                INSERT INTO bar_overview VALUES (?, ?, ?, ?, ?, ?)
-            """, [
-                symbol, exchange.value, interval.value,
-                len(bars), bars[0].datetime, bars[-1].datetime
-            ])
-        elif stream:
-            self.conn.execute("""
-                UPDATE bar_overview
-                SET end_dt = ?, count = count + ?
+            row: tuple | None = conn.execute("""
+                SELECT count, start_dt, end_dt FROM bar_overview
                 WHERE symbol = ? AND exchange = ? AND interval = ?
-            """, [bars[-1].datetime, len(bars), symbol, exchange.value, interval.value])
-        else:
-            count: int = self.conn.execute("""
-                SELECT COUNT(*) FROM bar_data
-                WHERE symbol = ? AND exchange = ? AND interval = ?
-            """, [symbol, exchange.value, interval.value]).fetchone()[0]
+            """, [symbol, exchange.value, interval.value]).fetchone()
 
-            new_start: datetime = min(bars[0].datetime, row[1])
-            new_end: datetime = max(bars[-1].datetime, row[2])
+            if not row:
+                conn.execute("""
+                    INSERT INTO bar_overview VALUES (?, ?, ?, ?, ?, ?)
+                """, [
+                    symbol, exchange.value, interval.value,
+                    len(bars), bars[0].datetime, bars[-1].datetime
+                ])
+            elif stream:
+                conn.execute("""
+                    UPDATE bar_overview
+                    SET end_dt = ?, count = count + ?
+                    WHERE symbol = ? AND exchange = ? AND interval = ?
+                """, [bars[-1].datetime, len(bars), symbol, exchange.value, interval.value])
+            else:
+                count: int = conn.execute("""
+                    SELECT COUNT(*) FROM bar_data
+                    WHERE symbol = ? AND exchange = ? AND interval = ?
+                """, [symbol, exchange.value, interval.value]).fetchone()[0]
 
-            self.conn.execute("""
-                UPDATE bar_overview
-                SET start_dt = ?, end_dt = ?, count = ?
-                WHERE symbol = ? AND exchange = ? AND interval = ?
-            """, [new_start, new_end, count, symbol, exchange.value, interval.value])
+                new_start: datetime = min(bars[0].datetime, row[1])
+                new_end: datetime = max(bars[-1].datetime, row[2])
+
+                conn.execute("""
+                    UPDATE bar_overview
+                    SET start_dt = ?, end_dt = ?, count = ?
+                    WHERE symbol = ? AND exchange = ? AND interval = ?
+                """, [new_start, new_end, count, symbol, exchange.value, interval.value])
 
         return True
 
     def save_tick_data(self, ticks: list[TickData], stream: bool = False) -> bool:
         """保存TICK数据"""
-        # 读取主键参数
         tick: TickData = ticks[0]
         symbol: str = tick.symbol
         exchange: Exchange = tick.exchange
 
-        # 将TickData数据转换为元组列表，并调整时区
         data: list[tuple] = []
         for tick in ticks:
             tick.datetime = convert_tz(tick.datetime)
@@ -237,78 +271,77 @@ class DuckdbDatabase(BaseDatabase):
                 tick.localtime,
             ))
 
-        # 使用upsert操作将数据批量写入数据库
-        self.conn.executemany("""
-            INSERT INTO tick_data VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )
-            ON CONFLICT (symbol, exchange, datetime) DO UPDATE SET
-                name          = excluded.name,
-                volume        = excluded.volume,
-                turnover      = excluded.turnover,
-                open_interest = excluded.open_interest,
-                last_price    = excluded.last_price,
-                last_volume   = excluded.last_volume,
-                limit_up      = excluded.limit_up,
-                limit_down    = excluded.limit_down,
-                open_price    = excluded.open_price,
-                high_price    = excluded.high_price,
-                low_price     = excluded.low_price,
-                pre_close     = excluded.pre_close,
-                bid_price_1   = excluded.bid_price_1,
-                bid_price_2   = excluded.bid_price_2,
-                bid_price_3   = excluded.bid_price_3,
-                bid_price_4   = excluded.bid_price_4,
-                bid_price_5   = excluded.bid_price_5,
-                ask_price_1   = excluded.ask_price_1,
-                ask_price_2   = excluded.ask_price_2,
-                ask_price_3   = excluded.ask_price_3,
-                ask_price_4   = excluded.ask_price_4,
-                ask_price_5   = excluded.ask_price_5,
-                bid_volume_1  = excluded.bid_volume_1,
-                bid_volume_2  = excluded.bid_volume_2,
-                bid_volume_3  = excluded.bid_volume_3,
-                bid_volume_4  = excluded.bid_volume_4,
-                bid_volume_5  = excluded.bid_volume_5,
-                ask_volume_1  = excluded.ask_volume_1,
-                ask_volume_2  = excluded.ask_volume_2,
-                ask_volume_3  = excluded.ask_volume_3,
-                ask_volume_4  = excluded.ask_volume_4,
-                ask_volume_5  = excluded.ask_volume_5,
-                localtime     = excluded.localtime
-        """, data)
+        with self._write_conn() as conn:
+            conn.executemany("""
+                INSERT INTO tick_data VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                ON CONFLICT (symbol, exchange, datetime) DO UPDATE SET
+                    name          = excluded.name,
+                    volume        = excluded.volume,
+                    turnover      = excluded.turnover,
+                    open_interest = excluded.open_interest,
+                    last_price    = excluded.last_price,
+                    last_volume   = excluded.last_volume,
+                    limit_up      = excluded.limit_up,
+                    limit_down    = excluded.limit_down,
+                    open_price    = excluded.open_price,
+                    high_price    = excluded.high_price,
+                    low_price     = excluded.low_price,
+                    pre_close     = excluded.pre_close,
+                    bid_price_1   = excluded.bid_price_1,
+                    bid_price_2   = excluded.bid_price_2,
+                    bid_price_3   = excluded.bid_price_3,
+                    bid_price_4   = excluded.bid_price_4,
+                    bid_price_5   = excluded.bid_price_5,
+                    ask_price_1   = excluded.ask_price_1,
+                    ask_price_2   = excluded.ask_price_2,
+                    ask_price_3   = excluded.ask_price_3,
+                    ask_price_4   = excluded.ask_price_4,
+                    ask_price_5   = excluded.ask_price_5,
+                    bid_volume_1  = excluded.bid_volume_1,
+                    bid_volume_2  = excluded.bid_volume_2,
+                    bid_volume_3  = excluded.bid_volume_3,
+                    bid_volume_4  = excluded.bid_volume_4,
+                    bid_volume_5  = excluded.bid_volume_5,
+                    ask_volume_1  = excluded.ask_volume_1,
+                    ask_volume_2  = excluded.ask_volume_2,
+                    ask_volume_3  = excluded.ask_volume_3,
+                    ask_volume_4  = excluded.ask_volume_4,
+                    ask_volume_5  = excluded.ask_volume_5,
+                    localtime     = excluded.localtime
+            """, data)
 
-        # 更新Tick汇总数据
-        row: tuple | None = self.conn.execute("""
-            SELECT count, start_dt, end_dt FROM tick_overview
-            WHERE symbol = ? AND exchange = ?
-        """, [symbol, exchange.value]).fetchone()
-
-        if not row:
-            self.conn.execute("""
-                INSERT INTO tick_overview VALUES (?, ?, ?, ?, ?)
-            """, [symbol, exchange.value, len(ticks), ticks[0].datetime, ticks[-1].datetime])
-        elif stream:
-            self.conn.execute("""
-                UPDATE tick_overview
-                SET end_dt = ?, count = count + ?
+            row: tuple | None = conn.execute("""
+                SELECT count, start_dt, end_dt FROM tick_overview
                 WHERE symbol = ? AND exchange = ?
-            """, [ticks[-1].datetime, len(ticks), symbol, exchange.value])
-        else:
-            count: int = self.conn.execute("""
-                SELECT COUNT(*) FROM tick_data
-                WHERE symbol = ? AND exchange = ?
-            """, [symbol, exchange.value]).fetchone()[0]
+            """, [symbol, exchange.value]).fetchone()
 
-            new_start: datetime = min(ticks[0].datetime, row[1])
-            new_end: datetime = max(ticks[-1].datetime, row[2])
+            if not row:
+                conn.execute("""
+                    INSERT INTO tick_overview VALUES (?, ?, ?, ?, ?)
+                """, [symbol, exchange.value, len(ticks), ticks[0].datetime, ticks[-1].datetime])
+            elif stream:
+                conn.execute("""
+                    UPDATE tick_overview
+                    SET end_dt = ?, count = count + ?
+                    WHERE symbol = ? AND exchange = ?
+                """, [ticks[-1].datetime, len(ticks), symbol, exchange.value])
+            else:
+                count: int = conn.execute("""
+                    SELECT COUNT(*) FROM tick_data
+                    WHERE symbol = ? AND exchange = ?
+                """, [symbol, exchange.value]).fetchone()[0]
 
-            self.conn.execute("""
-                UPDATE tick_overview
-                SET start_dt = ?, end_dt = ?, count = ?
-                WHERE symbol = ? AND exchange = ?
-            """, [new_start, new_end, count, symbol, exchange.value])
+                new_start: datetime = min(ticks[0].datetime, row[1])
+                new_end: datetime = max(ticks[-1].datetime, row[2])
+
+                conn.execute("""
+                    UPDATE tick_overview
+                    SET start_dt = ?, end_dt = ?, count = ?
+                    WHERE symbol = ? AND exchange = ?
+                """, [new_start, new_end, count, symbol, exchange.value])
 
         return True
 
@@ -427,20 +460,21 @@ class DuckdbDatabase(BaseDatabase):
         interval: Interval
     ) -> int:
         """删除K线数据"""
-        count: int = self.conn.execute("""
-            SELECT COUNT(*) FROM bar_data
-            WHERE symbol = ? AND exchange = ? AND interval = ?
-        """, [symbol, exchange.value, interval.value]).fetchone()[0]
+        with self._write_conn() as conn:
+            count: int = conn.execute("""
+                SELECT COUNT(*) FROM bar_data
+                WHERE symbol = ? AND exchange = ? AND interval = ?
+            """, [symbol, exchange.value, interval.value]).fetchone()[0]
 
-        self.conn.execute("""
-            DELETE FROM bar_data
-            WHERE symbol = ? AND exchange = ? AND interval = ?
-        """, [symbol, exchange.value, interval.value])
+            conn.execute("""
+                DELETE FROM bar_data
+                WHERE symbol = ? AND exchange = ? AND interval = ?
+            """, [symbol, exchange.value, interval.value])
 
-        self.conn.execute("""
-            DELETE FROM bar_overview
-            WHERE symbol = ? AND exchange = ? AND interval = ?
-        """, [symbol, exchange.value, interval.value])
+            conn.execute("""
+                DELETE FROM bar_overview
+                WHERE symbol = ? AND exchange = ? AND interval = ?
+            """, [symbol, exchange.value, interval.value])
 
         return count
 
@@ -450,34 +484,37 @@ class DuckdbDatabase(BaseDatabase):
         exchange: Exchange
     ) -> int:
         """删除TICK数据"""
-        count: int = self.conn.execute("""
-            SELECT COUNT(*) FROM tick_data
-            WHERE symbol = ? AND exchange = ?
-        """, [symbol, exchange.value]).fetchone()[0]
+        with self._write_conn() as conn:
+            count: int = conn.execute("""
+                SELECT COUNT(*) FROM tick_data
+                WHERE symbol = ? AND exchange = ?
+            """, [symbol, exchange.value]).fetchone()[0]
 
-        self.conn.execute("""
-            DELETE FROM tick_data
-            WHERE symbol = ? AND exchange = ?
-        """, [symbol, exchange.value])
+            conn.execute("""
+                DELETE FROM tick_data
+                WHERE symbol = ? AND exchange = ?
+            """, [symbol, exchange.value])
 
-        self.conn.execute("""
-            DELETE FROM tick_overview
-            WHERE symbol = ? AND exchange = ?
-        """, [symbol, exchange.value])
+            conn.execute("""
+                DELETE FROM tick_overview
+                WHERE symbol = ? AND exchange = ?
+            """, [symbol, exchange.value])
 
         return count
 
     def get_bar_overview(self) -> list[BarOverview]:
         """查询数据库中的K线汇总信息"""
-        # 如果已有K线数据但缺失汇总信息，则执行初始化
         data_count: int = self.conn.execute(
             "SELECT COUNT(*) FROM bar_data"
         ).fetchone()[0]
         overview_count: int = self.conn.execute(
             "SELECT COUNT(*) FROM bar_overview"
         ).fetchone()[0]
+
         if data_count and not overview_count:
-            self.init_bar_overview()
+            # init_bar_overview 需要写权限，临时切换读写连接
+            with self._write_conn() as conn:
+                self._init_bar_overview(conn)
 
         rows: list[tuple] = self.conn.execute("""
             SELECT symbol, exchange, interval, count, start_dt, end_dt
@@ -519,8 +556,13 @@ class DuckdbDatabase(BaseDatabase):
         return overviews
 
     def init_bar_overview(self) -> None:
-        """初始化数据库中的K线汇总信息"""
-        rows: list[tuple] = self.conn.execute("""
+        """初始化数据库中的K线汇总信息（公开接口）"""
+        with self._write_conn() as conn:
+            self._init_bar_overview(conn)
+
+    def _init_bar_overview(self, conn: duckdb.DuckDBPyConnection) -> None:
+        """初始化数据库中的K线汇总信息（内部实现，接受外部连接）"""
+        rows: list[tuple] = conn.execute("""
             SELECT symbol, exchange, interval,
                    COUNT(*) AS cnt,
                    MIN(datetime) AS start_dt,
@@ -530,7 +572,7 @@ class DuckdbDatabase(BaseDatabase):
         """).fetchall()
 
         for row in rows:
-            self.conn.execute("""
+            conn.execute("""
                 INSERT INTO bar_overview VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT (symbol, exchange, interval) DO UPDATE SET
                     count    = excluded.count,
